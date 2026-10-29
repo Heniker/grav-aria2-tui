@@ -1,3 +1,6 @@
+Written by agent in a single prompt.
+tldr: TUI torrent manager for my needs.
+
 # grav-aria2-tui
 
 A fast, production-ready, minimalist Terminal User Interface (TUI) for managing BitTorrent downloads and seeding via `aria2c`. Written in Rust using `ratatui`, `tokio`, and `crossterm`.
