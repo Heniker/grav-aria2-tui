@@ -19,7 +19,7 @@ mod rpc;
 mod state;
 mod ui;
 
-use app::{Action, App, AppWorker, Modal, strip_quotes};
+use app::{Action, App, AppWorker, Modal, clean_path, clean_path_str, strip_quotes};
 use cli::Cli;
 use process::ProcessManager;
 use state::AppStateStorage;
@@ -29,11 +29,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. Ensure download dir and .torrent metadata dir exist
-    let base_dir = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
-    if !base_dir.exists() {
-        std::fs::create_dir_all(&base_dir)
-            .with_context(|| format!("Failed to create download directory {:?}", base_dir))?;
+    if !cli.dir.exists() {
+        std::fs::create_dir_all(&cli.dir)
+            .with_context(|| format!("Failed to create download directory {:?}", cli.dir))?;
     }
+
+    let canonical = std::fs::canonicalize(&cli.dir).unwrap_or_else(|_| cli.dir.clone());
+    let base_dir = clean_path(&canonical);
 
     let meta_dir = AppStateStorage::torrent_meta_dir(&base_dir);
     if !meta_dir.exists() {
@@ -272,7 +274,11 @@ async fn handle_key_event(app: &mut App, code: KeyCode, _modifiers: KeyModifiers
             }
             KeyCode::Enter => {
                 let target = path_or_magnet.trim().to_string();
-                let clean = strip_quotes(&target);
+                let clean = if target.starts_with("magnet:") {
+                    strip_quotes(&target)
+                } else {
+                    clean_path_str(&strip_quotes(&target))
+                };
                 let tag_list: Vec<String> = tags
                     .split(',')
                     .map(|t| t.trim().to_lowercase())

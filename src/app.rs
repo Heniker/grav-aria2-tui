@@ -1,6 +1,6 @@
 use base64::Engine;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::process::ProcessManager;
@@ -562,9 +562,17 @@ impl AppWorker {
         let mut live_by_hash: HashMap<String, DownloadStatus> = HashMap::new();
         let mut magnet_fetching: Vec<DownloadStatus> = Vec::new();
 
-        // Check active, waiting, stopped downloads
-        for d in active.into_iter().chain(waiting.into_iter()).chain(stopped.into_iter()) {
-            if let Some(ref hash) = d.info_hash {
+        // Priority order: stopped (lowest) -> waiting -> active (highest).
+        // Evaluating active last ensures that active tasks with live speeds overwrite any stopped entries.
+        let all_downloads = stopped.into_iter().chain(waiting.into_iter()).chain(active.into_iter());
+        for d in all_downloads {
+            let is_metadata = d.info_hash.is_none()
+                || d.files.as_ref().map_or(false, |fl| fl.iter().any(|f| f.path.starts_with("[METADATA]")))
+                || d.followed_by.as_ref().map_or(false, |f| !f.is_empty());
+
+            if is_metadata {
+                magnet_fetching.push(d);
+            } else if let Some(ref hash) = d.info_hash {
                 let h = hash.to_lowercase();
                 // Check if metadata completed and aria2 saved <hash>.torrent in <DIR>
                 if let Some(dest) = detect_and_move_saved_metadata(&self.base_dir, &h) {
@@ -579,9 +587,6 @@ impl AppWorker {
                     }
                 }
                 live_by_hash.insert(h, d);
-            } else {
-                // If it's a magnet or download without info_hash yet
-                magnet_fetching.push(d);
             }
         }
 
@@ -640,6 +645,8 @@ impl AppWorker {
                                     files: selection_items,
                                 }).await;
                             }
+                            // Clean up obsolete metadata download result from aria2
+                            let _ = self.process_mgr.client.remove_download_result(&m.gid).await;
                         }
                     }
                 }
@@ -659,21 +666,26 @@ impl AppWorker {
                 let dl_speed: u64 = live.download_speed.parse().unwrap_or(0);
                 let ul_speed: u64 = live.upload_speed.parse().unwrap_or(0);
 
-                let is_complete = meta.is_complete || (total > 0 && completed >= total);
+                let is_complete = meta.is_complete
+                    || (total > 0 && completed >= total)
+                    || live.seeder.as_deref() == Some("true")
+                    || live.status == "complete";
                 meta.is_complete = is_complete;
 
                 let status = if meta.awaiting_file_selection {
                     TorrentStatus::SelectFiles
-                } else if live.status == "paused" {
-                    TorrentStatus::Paused
                 } else if live.status == "error" {
                     TorrentStatus::Error
-                } else if is_complete {
-                    TorrentStatus::Seeding
+                } else if live.status == "paused" {
+                    TorrentStatus::Paused
                 } else if live.status == "active" {
-                    TorrentStatus::Downloading
+                    if is_complete || live.seeder.as_deref() == Some("true") {
+                        TorrentStatus::Seeding
+                    } else {
+                        TorrentStatus::Downloading
+                    }
                 } else if live.status == "complete" {
-                    TorrentStatus::Seeding
+                    TorrentStatus::StoppedSaved
                 } else {
                     TorrentStatus::StoppedSaved
                 };
@@ -755,7 +767,9 @@ impl AppWorker {
             let uploaded: u64 = live.upload_length.parse().unwrap_or(0);
             let dl_speed: u64 = live.download_speed.parse().unwrap_or(0);
             let ul_speed: u64 = live.upload_speed.parse().unwrap_or(0);
-            let is_comp = total > 0 && completed >= total;
+            let is_comp = (total > 0 && completed >= total)
+                || live.seeder.as_deref() == Some("true")
+                || live.status == "complete";
 
             let name = live
                 .bittorrent
@@ -787,12 +801,18 @@ impl AppWorker {
                 },
             );
 
-            let status = if live.status == "paused" {
+            let status = if live.status == "error" {
+                TorrentStatus::Error
+            } else if live.status == "paused" {
                 TorrentStatus::Paused
-            } else if is_comp || live.status == "complete" {
-                TorrentStatus::Seeding
             } else if live.status == "active" {
-                TorrentStatus::Downloading
+                if is_comp || live.seeder.as_deref() == Some("true") {
+                    TorrentStatus::Seeding
+                } else {
+                    TorrentStatus::Downloading
+                }
+            } else if live.status == "complete" {
+                TorrentStatus::StoppedSaved
             } else {
                 TorrentStatus::StoppedSaved
             };
@@ -823,10 +843,24 @@ impl AppWorker {
 
         // 3. Magnets currently fetching metadata
         for m in magnet_fetching {
-            let tags = self.pending_magnet_tags.get(&m.gid).cloned().unwrap_or_default();
-            let name = format!("Magnet ({})", m.gid);
+            if m.followed_by.is_some() || (m.status != "active" && m.status != "waiting") {
+                continue;
+            }
+            let key = m.info_hash.as_deref().unwrap_or(&m.gid).to_lowercase();
+            let tags = self
+                .pending_magnet_tags
+                .get(&m.gid)
+                .cloned()
+                .or_else(|| self.pending_magnet_tags.get(&key).cloned())
+                .unwrap_or_default();
+            let name = m
+                .bittorrent
+                .as_ref()
+                .and_then(|bt| bt.info.as_ref())
+                .and_then(|i| i.name.clone())
+                .unwrap_or_else(|| format!("Magnet ({})", &m.gid[..m.gid.len().min(8)]));
             items.push(TorrentItem {
-                info_hash: m.gid.clone(),
+                info_hash: key,
                 gid: Some(m.gid),
                 name,
                 tags,
@@ -941,7 +975,9 @@ impl AppWorker {
         });
 
         let mut opts = serde_json::Map::new();
-        opts.insert("dir".to_string(), serde_json::json!(self.base_dir.to_string_lossy().to_string()));
+        let dir_clean = clean_path(&self.base_dir).to_string_lossy().to_string();
+        opts.insert("dir".to_string(), serde_json::json!(dir_clean));
+        opts.insert("file-allocation".to_string(), serde_json::json!("none"));
         if !meta.selected_files.is_empty() {
             opts.insert("select-file".to_string(), serde_json::json!(meta.selected_files));
         }
@@ -954,7 +990,7 @@ impl AppWorker {
         if !meta.seed_ratio.is_empty() {
             opts.insert("seed-ratio".to_string(), serde_json::json!(meta.seed_ratio));
         }
-        if !meta.seed_time.is_empty() {
+        if !meta.seed_time.is_empty() && meta.seed_time != "0" {
             opts.insert("seed-time".to_string(), serde_json::json!(meta.seed_time));
         }
 
@@ -1006,13 +1042,13 @@ impl AppWorker {
     }
 
     async fn add_torrent_path(&mut self, file_path_str: &str, tags: Vec<String>) {
-        let clean_path = strip_quotes(file_path_str);
-        let path = PathBuf::from(&clean_path);
+        let clean_input_path = clean_path_str(&strip_quotes(file_path_str));
+        let path = PathBuf::from(&clean_input_path);
 
         if !path.is_file() {
             let _ = self.worker_tx.send(WorkerMessage::ShowMessage {
                 title: "File Not Found".to_string(),
-                message: format!("Torrent file does not exist: {}", clean_path),
+                message: format!("Torrent file does not exist: {}", clean_input_path),
                 is_error: true,
             }).await;
             return;
@@ -1034,8 +1070,10 @@ impl AppWorker {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         let mut opts = serde_json::Map::new();
-        opts.insert("dir".to_string(), serde_json::json!(self.base_dir.to_string_lossy().to_string()));
+        let dir_clean = clean_path(&self.base_dir).to_string_lossy().to_string();
+        opts.insert("dir".to_string(), serde_json::json!(dir_clean));
         opts.insert("pause".to_string(), serde_json::json!("true"));
+        opts.insert("file-allocation".to_string(), serde_json::json!("none"));
 
         let gid = match self.process_mgr.client.add_torrent(&b64, vec![], serde_json::Value::Object(opts)).await {
             Ok(id) => id,
@@ -1117,9 +1155,11 @@ impl AppWorker {
         }
 
         let mut opts = serde_json::Map::new();
-        opts.insert("dir".to_string(), serde_json::json!(self.base_dir.to_string_lossy().to_string()));
+        let dir_clean = clean_path(&self.base_dir).to_string_lossy().to_string();
+        opts.insert("dir".to_string(), serde_json::json!(dir_clean));
         opts.insert("bt-save-metadata".to_string(), serde_json::json!("true"));
         opts.insert("pause-metadata".to_string(), serde_json::json!("true"));
+        opts.insert("file-allocation".to_string(), serde_json::json!("none"));
 
         let gid = match self.process_mgr.client.add_uri(vec![clean_magnet.clone()], serde_json::Value::Object(opts)).await {
             Ok(g) => g,
@@ -1242,7 +1282,10 @@ impl AppWorker {
 
         if let Some(gid) = target_gid {
             let mut opts = serde_json::Map::new();
-            opts.insert("select-file".to_string(), serde_json::json!(selected_indices));
+            if !selected_indices.is_empty() {
+                opts.insert("select-file".to_string(), serde_json::json!(selected_indices));
+            }
+            opts.insert("file-allocation".to_string(), serde_json::json!("none"));
             let _ = self.process_mgr.client.change_option(&gid, serde_json::Value::Object(opts)).await;
             let _ = self.process_mgr.client.unpause(&gid).await;
         }
@@ -1291,7 +1334,9 @@ impl AppWorker {
             opts.insert("max-download-limit".to_string(), serde_json::json!(max_dl));
             opts.insert("max-upload-limit".to_string(), serde_json::json!(max_ul));
             opts.insert("seed-ratio".to_string(), serde_json::json!(ratio));
-            opts.insert("seed-time".to_string(), serde_json::json!(time));
+            if time != "0" {
+                opts.insert("seed-time".to_string(), serde_json::json!(time));
+            }
             let _ = self.process_mgr.client.change_option(&gid, serde_json::Value::Object(opts)).await;
         }
     }
@@ -1313,7 +1358,9 @@ impl AppWorker {
         opts.insert("max-overall-download-limit".to_string(), serde_json::json!(max_dl));
         opts.insert("max-overall-upload-limit".to_string(), serde_json::json!(max_ul));
         opts.insert("seed-ratio".to_string(), serde_json::json!(ratio));
-        opts.insert("seed-time".to_string(), serde_json::json!(time));
+        if time != "0" {
+            opts.insert("seed-time".to_string(), serde_json::json!(time));
+        }
         let _ = self.process_mgr.client.change_global_option(serde_json::Value::Object(opts)).await;
     }
 
@@ -1375,6 +1422,26 @@ impl AppWorker {
         self.state.torrents.remove(&h);
         let _ = self.state.save(&self.base_dir);
     }
+}
+
+pub fn clean_path_str(s: &str) -> String {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = trimmed.strip_prefix(r"\??\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else if let Some(rest) = trimmed.strip_prefix(r"\??\") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn clean_path<P: AsRef<Path>>(p: P) -> PathBuf {
+    let s = p.as_ref().to_string_lossy();
+    PathBuf::from(clean_path_str(&s))
 }
 
 pub fn strip_quotes(s: &str) -> String {
@@ -1459,6 +1526,16 @@ mod tests {
         assert_eq!(strip_quotes("no_quotes.torrent"), "no_quotes.torrent");
         assert_eq!(strip_quotes("\"\""), "");
         assert_eq!(strip_quotes("''"), "");
+    }
+
+    #[test]
+    fn test_clean_path_str() {
+        assert_eq!(clean_path_str(r"\\?\C:\Users\mark\Downloads"), r"C:\Users\mark\Downloads");
+        assert_eq!(clean_path_str(r"\\?\UNC\server\share\file.torrent"), r"\\server\share\file.torrent");
+        assert_eq!(clean_path_str(r"\??\D:\torrents"), r"D:\torrents");
+        assert_eq!(clean_path_str(r"\??\UNC\server\share"), r"\\server\share");
+        assert_eq!(clean_path_str(r"K:\_my\code\grav-aria2-tui"), r"K:\_my\code\grav-aria2-tui");
+        assert_eq!(clean_path_str("/tmp/torrents"), "/tmp/torrents");
     }
 
     #[test]

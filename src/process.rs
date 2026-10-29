@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
+use crate::app::clean_path;
 use crate::rpc::Aria2RpcClient;
 
 pub struct ProcessManager {
@@ -20,15 +21,19 @@ impl ProcessManager {
         download_dir: &Path,
     ) -> Result<Self> {
         let client = Aria2RpcClient::new(rpc_url.to_string(), rpc_secret.clone());
-        let dir_str = download_dir.to_string_lossy().to_string();
+        let clean_dir = clean_path(download_dir);
+        let dir_str = clean_dir.to_string_lossy().to_string();
 
         // 1. Check if an aria2c instance is already running and responding
         match client.get_version().await {
             Ok(ver) => {
                 log::info!("Connected to existing aria2c instance (v{})", ver.version);
-                // Set global dir on existing instance
+                // Set global dir and disable file allocation on existing instance
                 let _ = client
-                    .change_global_option(serde_json::json!({ "dir": &dir_str }))
+                    .change_global_option(serde_json::json!({
+                        "dir": &dir_str,
+                        "file-allocation": "none"
+                    }))
                     .await;
                 return Ok(Self {
                     client,
@@ -50,10 +55,10 @@ impl ProcessManager {
             .arg("--rpc-listen-all=false")
             .arg(format!("--rpc-listen-port={}", port))
             .arg(format!("--dir={}", dir_str))
+            .arg("--file-allocation=none")
             .arg("--bt-save-metadata=true")
             .arg("--bt-load-saved-metadata=true")
             .arg("--continue=true")
-            .arg("--seed-time=0")
             .arg("--quiet=true")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -175,6 +180,13 @@ mod tests {
             assert!(mgr.spawned_by_us);
             let ver = mgr.client.get_version().await;
             assert!(ver.is_ok());
+
+            // Verify file-allocation is "none" by default
+            let opts = mgr.client.get_global_option().await;
+            if let Ok(val) = opts {
+                assert_eq!(val.get("file-allocation").and_then(|v| v.as_str()), Some("none"));
+            }
+
             mgr.shutdown().await;
         }
 
