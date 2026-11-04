@@ -4,12 +4,11 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-use crate::app::clean_path;
 use crate::rpc::Aria2RpcClient;
+use crate::utils::clean_path;
 
 pub struct ProcessManager {
     pub client: Aria2RpcClient,
-    pub spawned_by_us: bool,
     child: Option<Child>,
 }
 
@@ -24,32 +23,10 @@ impl ProcessManager {
         let clean_dir = clean_path(download_dir);
         let dir_str = clean_dir.to_string_lossy().to_string();
 
-        // 1. Check if an aria2c instance is already running and responding
-        match client.get_version().await {
-            Ok(ver) => {
-                log::info!("Connected to existing aria2c instance (v{})", ver.version);
-                // Set global dir and disable file allocation on existing instance
-                let _ = client
-                    .change_global_option(serde_json::json!({
-                        "dir": &dir_str,
-                        "file-allocation": "none"
-                    }))
-                    .await;
-                return Ok(Self {
-                    client,
-                    spawned_by_us: false,
-                    child: None,
-                });
-            }
-            Err(_) => {
-                log::info!("No existing aria2c instance responded at {}. Spawning one...", rpc_url);
-            }
-        }
-
-        // 2. Determine listen port from rpc_url (default 6800)
+        // 1. Determine listen port from rpc_url (default 6800)
         let port = extract_port_from_url(rpc_url).unwrap_or(6800);
 
-        // 3. Build spawn command
+        // 2. Build spawn command for dedicated aria2c process
         let mut cmd = Command::new(aria2_bin);
         cmd.arg("--enable-rpc=true")
             .arg("--rpc-listen-all=false")
@@ -73,21 +50,21 @@ impl ProcessManager {
 
         let mut mgr = Self {
             client,
-            spawned_by_us: true,
             child: Some(child),
         };
 
-        // 4. Poll getVersion until RPC server is ready
+        // 3. Poll getVersion until RPC server is ready
         let mut ready = false;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // Check if child process died early
+            // Check if child process died early (e.g. port already in use)
             if let Some(ref mut c) = mgr.child {
                 if let Ok(Some(status)) = c.try_wait() {
                     bail!(
-                        "aria2c exited unexpectedly with code {:?} before RPC was ready.",
-                        status.code()
+                        "aria2c exited unexpectedly with code {:?} before RPC was ready. Port {} may already be in use.",
+                        status.code(),
+                        port
                     );
                 }
             }
@@ -116,25 +93,24 @@ impl ProcessManager {
     }
 
     pub async fn shutdown(&mut self) {
-        if self.spawned_by_us {
-            // Attempt graceful RPC shutdown
-            let _ = tokio::time::timeout(Duration::from_millis(800), self.client.shutdown()).await;
+        // Attempt graceful RPC shutdown; only kill the child if it doesn't respond
+        let graceful = tokio::time::timeout(Duration::from_millis(800), self.client.shutdown())
+            .await
+            .is_ok();
 
-            // Ensure child process terminates
-            if let Some(mut child) = self.child.take() {
+        if let Some(mut child) = self.child.take() {
+            if !graceful {
                 let _ = child.kill().await;
-                let _ = child.wait().await;
             }
+            let _ = child.wait().await;
         }
     }
 }
 
 impl Drop for ProcessManager {
     fn drop(&mut self) {
-        if self.spawned_by_us {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.start_kill();
-            }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
         }
     }
 }
@@ -177,7 +153,6 @@ mod tests {
         let url = "http://127.0.0.1:6891/jsonrpc";
         let res = ProcessManager::init("aria2c", url, None, &temp_dir).await;
         if let Ok(mut mgr) = res {
-            assert!(mgr.spawned_by_us);
             let ver = mgr.client.get_version().await;
             assert!(ver.is_ok());
 

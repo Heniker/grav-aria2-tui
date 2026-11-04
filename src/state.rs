@@ -60,12 +60,82 @@ pub struct TorrentMetadata {
     pub awaiting_file_selection: bool,
 }
 
+impl TorrentMetadata {
+    /// Creates a new entry with sane defaults derived from the global configuration.
+    pub fn new(
+        info_hash: impl Into<String>,
+        name: impl Into<String>,
+        tags: Vec<String>,
+        global: &GlobalLimitsConfig,
+    ) -> Self {
+        let hash = info_hash.into();
+        Self {
+            torrent_filename: format!("{}.torrent", hash),
+            info_hash: hash,
+            name: name.into(),
+            tags,
+            selected_files: String::new(),
+            max_download_limit: "0".into(),
+            max_upload_limit: "0".into(),
+            seed_ratio: global.default_seed_ratio.clone(),
+            seed_time: global.default_seed_time.clone(),
+            is_complete: false,
+            awaiting_file_selection: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppStateStorage {
     #[serde(default)]
     pub global_limits: GlobalLimitsConfig,
     #[serde(default)]
     pub torrents: HashMap<String, TorrentMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTorrentCandidate {
+    pub info_hash: String,
+    pub name: String,
+    #[allow(dead_code)]
+    pub file_path: PathBuf,
+    pub selected: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct StartupScanResult {
+    #[allow(dead_code)]
+    pub pruned_torrents: Vec<(String, String)>,
+    pub new_untracked: Vec<NewTorrentCandidate>,
+}
+
+/// Checks if payload files or directory for a torrent exist in base_dir
+pub fn check_torrent_payload_exists(base_dir: &Path, name: &str, info_hash: &str) -> bool {
+    // 1. Check using entry name
+    if !name.is_empty() && !name.starts_with("[Magnet]") {
+        let p = base_dir.join(name);
+        if p.exists() {
+            return true;
+        }
+    }
+
+    // 2. Check using bencoded name from .torrent file if available
+    let meta_dir = AppStateStorage::torrent_meta_dir(base_dir);
+    let torrent_file = meta_dir.join(format!("{}.torrent", info_hash.to_lowercase()));
+    if torrent_file.is_file() {
+        if let Ok(bytes) = fs::read(&torrent_file) {
+            if let Some((_, bencode_name)) = parse_torrent_info(&bytes) {
+                if !bencode_name.is_empty() {
+                    let p = base_dir.join(&bencode_name);
+                    if p.exists() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 impl AppStateStorage {
@@ -86,21 +156,15 @@ impl AppStateStorage {
 
         let path = Self::state_file_path(base_dir);
         if !path.exists() {
-            let mut state = AppStateStorage::default();
-            // Scan for any existing .torrent files inside .torrent/
-            state.scan_metadata_folder(base_dir);
+            let state = AppStateStorage::default();
             let _ = state.save(base_dir);
             return Ok(state);
         }
 
         let data = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read state file {:?}", path))?;
-        let mut state: AppStateStorage = serde_json::from_str(&data)
+        let state: AppStateStorage = serde_json::from_str(&data)
             .with_context(|| format!("Failed to parse state file {:?}", path))?;
-
-        // Scan folder for any newly added .torrent files
-        state.scan_metadata_folder(base_dir);
-        let _ = state.save(base_dir);
 
         Ok(state)
     }
@@ -131,63 +195,81 @@ impl AppStateStorage {
         Ok(())
     }
 
-    /// Scans <DIR>/.torrent/*.torrent and registers any that are missing in state.json
-    pub fn scan_metadata_folder(&mut self, base_dir: &Path) {
+    /// Synchronizes on startup:
+    /// 1. If torrent exists in state & .torrent exists, but no payload files detected: delete .torrent file and remove from state.
+    /// 2. If new .torrent files exist in .torrent/ that are not in state: returns them as untracked candidates to prompt the user.
+    pub fn sync_on_startup(&mut self, base_dir: &Path) -> Result<StartupScanResult> {
+        let mut pruned = Vec::new();
+        let mut to_remove = Vec::new();
         let meta_dir = Self::torrent_meta_dir(base_dir);
-        let entries = match fs::read_dir(&meta_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext.to_string_lossy().eq_ignore_ascii_case("torrent") {
-                        if let Ok(bytes) = fs::read(&path) {
-                            if let Some((info_hash, name)) = parse_torrent_info(&bytes) {
-                                let key = info_hash.to_lowercase();
-                                self.torrents.entry(key.clone()).or_insert_with(|| {
-                                    TorrentMetadata {
-                                        info_hash: key.clone(),
-                                        name: if name.is_empty() {
+        // 1. Scan existing torrents in state
+        for (hash, entry) in &self.torrents {
+            let torrent_file = meta_dir.join(format!("{}.torrent", hash.to_lowercase()));
+            let torrent_exists = torrent_file.is_file();
+            let payload_exists = check_torrent_payload_exists(base_dir, &entry.name, hash);
+
+            if torrent_exists && !payload_exists {
+                // Payload deleted by user -> remove .torrent file and state
+                let _ = fs::remove_file(&torrent_file);
+                let aria2_file = base_dir.join(format!("{}.aria2", entry.name));
+                if aria2_file.is_file() {
+                    let _ = fs::remove_file(&aria2_file);
+                }
+                to_remove.push(hash.clone());
+                pruned.push((hash.clone(), entry.name.clone()));
+            } else if !torrent_exists && !payload_exists {
+                // Both missing -> remove from state
+                to_remove.push(hash.clone());
+                pruned.push((hash.clone(), entry.name.clone()));
+            }
+        }
+
+        for hash in to_remove {
+            self.torrents.remove(&hash);
+        }
+
+        if !pruned.is_empty() {
+            let _ = self.save(base_dir);
+        }
+
+        // 2. Scan .torrent folder for untracked torrent files
+        let mut new_untracked = Vec::new();
+        if let Ok(entries) = fs::read_dir(&meta_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        if ext.to_string_lossy().eq_ignore_ascii_case("torrent") {
+                            if let Ok(bytes) = fs::read(&path) {
+                                if let Some((info_hash, name)) = parse_torrent_info(&bytes) {
+                                    let key = info_hash.to_lowercase();
+                                    if !self.torrents.contains_key(&key) {
+                                        let display_name = if name.is_empty() {
                                             path.file_stem()
                                                 .map(|s| s.to_string_lossy().to_string())
                                                 .unwrap_or_else(|| key.clone())
                                         } else {
                                             name
-                                        },
-                                        torrent_filename: format!("{}.torrent", key),
-                                        tags: Vec::new(),
-                                        selected_files: String::new(),
-                                        max_download_limit: "0".to_string(),
-                                        max_upload_limit: "0".to_string(),
-                                        seed_ratio: self.global_limits.default_seed_ratio.clone(),
-                                        seed_time: self.global_limits.default_seed_time.clone(),
-                                        is_complete: false,
-                                        awaiting_file_selection: false,
+                                        };
+                                        new_untracked.push(NewTorrentCandidate {
+                                            info_hash: key,
+                                            name: display_name,
+                                            file_path: path.clone(),
+                                            selected: true,
+                                        });
                                     }
-                                });
-                            } else {
-                                // If bencode parse failed, check if file_stem is 40 hex chars
-                                if let Some(stem) = path.file_stem() {
+                                } else if let Some(stem) = path.file_stem() {
                                     let stem_str = stem.to_string_lossy().to_lowercase();
                                     if stem_str.len() == 40 && stem_str.chars().all(|c| c.is_ascii_hexdigit()) {
-                                        self.torrents.entry(stem_str.clone()).or_insert_with(|| {
-                                            TorrentMetadata {
+                                        if !self.torrents.contains_key(&stem_str) {
+                                            new_untracked.push(NewTorrentCandidate {
                                                 info_hash: stem_str.clone(),
                                                 name: stem_str.clone(),
-                                                torrent_filename: format!("{}.torrent", stem_str),
-                                                tags: Vec::new(),
-                                                selected_files: String::new(),
-                                                max_download_limit: "0".to_string(),
-                                                max_upload_limit: "0".to_string(),
-                                                seed_ratio: self.global_limits.default_seed_ratio.clone(),
-                                                seed_time: self.global_limits.default_seed_time.clone(),
-                                                is_complete: false,
-                                                awaiting_file_selection: false,
-                                            }
-                                        });
+                                                file_path: path.clone(),
+                                                selected: true,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -196,7 +278,14 @@ impl AppStateStorage {
                 }
             }
         }
+
+        Ok(StartupScanResult {
+            pruned_torrents: pruned,
+            new_untracked,
+        })
     }
+
+
 }
 
 /// Copies a .torrent file into <DIR>/.torrent/<info_hash>.torrent
@@ -212,19 +301,6 @@ pub fn archive_torrent_file(source: &Path, base_dir: &Path, info_hash: &str) -> 
         fs::copy(source, &dest_path)
             .with_context(|| format!("Failed to copy torrent file {:?} to {:?}", source, dest_path))?;
     }
-    Ok(dest_path)
-}
-
-/// Saves raw bytes directly to <DIR>/.torrent/<info_hash>.torrent
-#[allow(dead_code)]
-pub fn save_torrent_bytes(bytes: &[u8], base_dir: &Path, info_hash: &str) -> Result<PathBuf> {
-    let dest_dir = AppStateStorage::torrent_meta_dir(base_dir);
-    if !dest_dir.exists() {
-        fs::create_dir_all(&dest_dir)?;
-    }
-    let dest_filename = format!("{}.torrent", info_hash.to_lowercase());
-    let dest_path = dest_dir.join(dest_filename);
-    fs::write(&dest_path, bytes)?;
     Ok(dest_path)
 }
 
@@ -377,7 +453,11 @@ impl<'a> BencodeParser<'a> {
                             break;
                         }
                         if let Some(k) = info_parser.read_byte_string() {
-                            if k == b"name" || k == b"name.utf-8" {
+                            if k == b"name.utf-8" {
+                                if let Some(v) = info_parser.read_byte_string() {
+                                    name = Some(String::from_utf8_lossy(v).to_string());
+                                }
+                            } else if k == b"name" && name.is_none() {
                                 if let Some(v) = info_parser.read_byte_string() {
                                     name = Some(String::from_utf8_lossy(v).to_string());
                                 }
@@ -432,22 +512,17 @@ mod tests {
 
         // Modify limits and add a torrent
         state.global_limits.max_overall_download_limit = "5M".to_string();
-        state.torrents.insert(
-            "aabbccddeeff00112233445566778899aabbccdd".to_string(),
-            TorrentMetadata {
-                info_hash: "aabbccddeeff00112233445566778899aabbccdd".to_string(),
-                name: "ArchLinux".to_string(),
-                torrent_filename: "aabbccddeeff00112233445566778899aabbccdd.torrent".to_string(),
-                tags: vec!["linux".to_string(), "iso".to_string()],
-                selected_files: "1,2".to_string(),
-                max_download_limit: "0".to_string(),
-                max_upload_limit: "0".to_string(),
-                seed_ratio: "2.0".to_string(),
-                seed_time: "60".to_string(),
-                is_complete: true,
-                awaiting_file_selection: false,
-            },
+        let mut meta = TorrentMetadata::new(
+            "aabbccddeeff00112233445566778899aabbccdd",
+            "ArchLinux",
+            vec!["linux".to_string(), "iso".to_string()],
+            &state.global_limits,
         );
+        meta.selected_files = "1,2".to_string();
+        meta.seed_ratio = "2.0".to_string();
+        meta.seed_time = "60".to_string();
+        meta.is_complete = true;
+        state.torrents.insert(meta.info_hash.clone(), meta);
 
         state.save(&temp_dir).unwrap();
 
@@ -461,6 +536,73 @@ mod tests {
         assert!(item.is_complete);
 
         // Clean up
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_check_torrent_payload_exists() {
+        let temp_dir = std::env::temp_dir().join(format!("grav_payload_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let hash = "1122334455667788990011223344556677889900";
+        assert!(!check_torrent_payload_exists(&temp_dir, "ubuntu.iso", hash));
+
+        // Create payload file
+        let file_path = temp_dir.join("ubuntu.iso");
+        let _ = fs::write(&file_path, b"dummy iso payload");
+        assert!(check_torrent_payload_exists(&temp_dir, "ubuntu.iso", hash));
+
+        // Delete payload file
+        let _ = fs::remove_file(&file_path);
+        assert!(!check_torrent_payload_exists(&temp_dir, "ubuntu.iso", hash));
+
+        // Create multi-file directory payload
+        let dir_path = temp_dir.join("MyFolder");
+        let _ = fs::create_dir_all(&dir_path);
+        assert!(check_torrent_payload_exists(&temp_dir, "MyFolder", hash));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_startup_sync_pruning_and_untracked() {
+        let temp_dir = std::env::temp_dir().join(format!("grav_sync_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let meta_dir = AppStateStorage::torrent_meta_dir(&temp_dir);
+        let _ = fs::create_dir_all(&meta_dir);
+
+        // Raw bencoded torrent for "test" torrent
+        let raw_torrent = b"d4:infod4:name4:test12:piece lengthi16384eee";
+        let (info_hash, name) = parse_torrent_info(raw_torrent).unwrap();
+
+        // 1. Create a torrent file in .torrent/
+        let torrent_file = meta_dir.join(format!("{}.torrent", info_hash));
+        let _ = fs::write(&torrent_file, raw_torrent);
+
+        // Load empty state
+        let mut state = AppStateStorage::load(&temp_dir).unwrap();
+
+        // Initially, .torrent file exists in folder but not in state -> should be detected as untracked
+        let sync1 = state.sync_on_startup(&temp_dir).unwrap();
+        assert_eq!(sync1.new_untracked.len(), 1);
+        assert_eq!(sync1.new_untracked[0].info_hash, info_hash);
+        assert_eq!(sync1.new_untracked[0].name, name);
+        assert!(sync1.pruned_torrents.is_empty());
+
+        // Now add it to state (simulating it was downloaded), but do NOT create payload file on disk
+        let mut meta = TorrentMetadata::new(info_hash.clone(), name.clone(), vec![], &state.global_limits);
+        meta.is_complete = true;
+        state.torrents.insert(info_hash.clone(), meta);
+        state.save(&temp_dir).unwrap();
+
+        // 2. Next sync_on_startup: torrent is in state, .torrent file exists, but NO payload files exist!
+        // Should prune .torrent file and remove from state!
+        let sync2 = state.sync_on_startup(&temp_dir).unwrap();
+        assert_eq!(sync2.pruned_torrents.len(), 1);
+        assert_eq!(sync2.pruned_torrents[0].0, info_hash);
+        assert!(!torrent_file.exists()); // .torrent file was deleted!
+        assert!(!state.torrents.contains_key(&info_hash)); // Removed from state!
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

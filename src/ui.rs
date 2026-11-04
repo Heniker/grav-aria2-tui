@@ -2,11 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 
-use crate::app::{
-    App, Modal, TorrentStatus, format_bytes, format_eta, format_speed,
-};
+use crate::app::{App, Modal, TorrentStatus};
+use crate::utils::{format_bytes, format_eta, format_speed};
 
 
 pub fn render(f: &mut Frame, app: &App) {
@@ -33,11 +32,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     // Top row: App title + directory + RPC badge | Speeds and limits
-    let rpc_badge = if app.spawned_by_us {
-        Span::styled(" [Connected: Spawned] ", Style::default().fg(Color::Green))
-    } else {
-        Span::styled(" [Connected: External] ", Style::default().fg(Color::Cyan))
-    };
+    let rpc_badge = Span::styled(" [aria2c: active] ", Style::default().fg(Color::Green));
 
     let dl_spd = app.global_stat.download_speed.parse::<u64>().unwrap_or(0);
     let ul_spd = app.global_stat.upload_speed.parse::<u64>().unwrap_or(0);
@@ -332,6 +327,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("Verify "),
         Span::styled("[d]:", Style::default().fg(Color::Yellow)),
         Span::raw("Del "),
+        Span::styled("[D]:", Style::default().fg(Color::LightRed)),
+        Span::raw("Del+Data "),
         Span::styled("[q]:", Style::default().fg(Color::Yellow)),
         Span::raw("Quit"),
     ]));
@@ -673,13 +670,19 @@ fn render_modal(f: &mut Frame, app: &App) {
             delete_files_from_disk,
             ..
         } => {
-            let area = centered_rect(65, 30, f.area());
+            let area = centered_rect(68, 38, f.area());
             f.render_widget(Clear, area);
+
+            let border_color = if *delete_files_from_disk {
+                Color::LightRed
+            } else {
+                Color::Yellow
+            };
 
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(" Remove Torrent Confirmation ")
-                .border_style(Style::default().fg(Color::Red));
+                .title(" Delete Torrent Confirmation ")
+                .border_style(Style::default().fg(border_color));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
@@ -687,23 +690,27 @@ fn render_modal(f: &mut Frame, app: &App) {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(2),
-                    Constraint::Length(3),
+                    Constraint::Length(4),
+                    Constraint::Length(2),
                     Constraint::Length(1),
                 ])
                 .split(inner);
 
             let prompt = Paragraph::new(vec![
-                Line::from(format!("Are you sure you want to remove: '{}'?", name)),
+                Line::from(vec![
+                    Span::styled("Target: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
             ]);
             f.render_widget(prompt, chunks[0]);
 
             let opt1_style = if !*delete_files_from_disk {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             let opt2_style = if *delete_files_from_disk {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -714,19 +721,131 @@ fn render_modal(f: &mut Frame, app: &App) {
                     opt1_style,
                 )),
                 Line::from(Span::styled(
-                    " [2] Remove from TUI, .torrent/, AND DELETE payload files from disk",
+                    " [2] PERMANENTLY DELETE payload data files from disk AND remove torrent",
                     opt2_style,
                 )),
             ]);
             f.render_widget(options, chunks[1]);
 
+            let warning = if *delete_files_from_disk {
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " CAUTION: Downloaded files will be permanently erased from your disk! ",
+                        Style::default().fg(Color::White).bg(Color::Red),
+                    ),
+                ]))
+            } else {
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " Downloaded payload files will remain intact in your download folder. ",
+                        Style::default().fg(Color::Green),
+                    ),
+                ]))
+            };
+            f.render_widget(warning, chunks[2]);
+
+            let legend = if *delete_files_from_disk {
+                Paragraph::new(Line::from(vec![
+                    Span::styled("[1/2 or Up/Down]", Style::default().fg(Color::Yellow)),
+                    Span::raw(" Switch  "),
+                    Span::styled("[y / Enter]", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+                    Span::raw(" CONFIRM DELETE DATA  "),
+                    Span::styled("[Esc / n]", Style::default().fg(Color::Cyan)),
+                    Span::raw(" Cancel"),
+                ]))
+            } else {
+                Paragraph::new(Line::from(vec![
+                    Span::styled("[1/2 or Up/Down]", Style::default().fg(Color::Yellow)),
+                    Span::raw(" Switch  "),
+                    Span::styled("[Enter]", Style::default().fg(Color::Green)),
+                    Span::raw(" Confirm Remove  "),
+                    Span::styled("[Esc / n]", Style::default().fg(Color::Cyan)),
+                    Span::raw(" Cancel"),
+                ]))
+            };
+            f.render_widget(legend, chunks[3]);
+        }
+        Modal::NewTorrentsFound {
+            torrents,
+            selected_index,
+        } => {
+            let area = centered_rect(72, 50, f.area());
+            f.render_widget(Clear, area);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" New Torrents Detected in .torrent/ ")
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Min(3),
+                    Constraint::Length(2),
+                ])
+                .split(inner);
+
+            let intro = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "The following .torrent files were found and are not yet in state:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    "Would you like to import and start downloading them?",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]);
+            f.render_widget(intro, chunks[0]);
+
+            let items: Vec<ListItem> = torrents
+                .iter()
+                .enumerate()
+                .map(|(i, candidate)| {
+                    let checkbox = if candidate.selected { "[x] " } else { "[ ] " };
+                    let is_active = i == *selected_index;
+                    let style = if is_active {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else if candidate.selected {
+                        Style::default().fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            checkbox,
+                            if candidate.selected {
+                                Style::default().fg(Color::Green)
+                            } else {
+                                Style::default().fg(Color::DarkGray)
+                            },
+                        ),
+                        Span::styled(&candidate.name, style),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("({})", &candidate.info_hash[..8.min(candidate.info_hash.len())]),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                })
+                .collect();
+
+            let list = List::new(items);
+            f.render_widget(list, chunks[1]);
+
             let legend = Paragraph::new(Line::from(vec![
-                Span::styled("[1/2 or Up/Down]", Style::default().fg(Color::Yellow)),
-                Span::raw(" Select  "),
-                Span::styled("[Enter]", Style::default().fg(Color::Green)),
-                Span::raw(" Confirm  "),
-                Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
-                Span::raw(" Cancel"),
+                Span::styled("[Space]", Style::default().fg(Color::Yellow)),
+                Span::raw(" Toggle  "),
+                Span::styled("[a/n]", Style::default().fg(Color::Yellow)),
+                Span::raw(" All/None  "),
+                Span::styled("[Enter/y]", Style::default().fg(Color::Green)),
+                Span::raw(" Start  "),
+                Span::styled("[s]", Style::default().fg(Color::Cyan)),
+                Span::raw(" Stopped  "),
+                Span::styled("[Esc]", Style::default().fg(Color::Red)),
+                Span::raw(" Ignore"),
             ]));
             f.render_widget(legend, chunks[2]);
         }

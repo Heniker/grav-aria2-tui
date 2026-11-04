@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -8,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct VersionInfo {
     pub version: String,
     #[serde(rename = "enabledFeatures", default)]
@@ -20,10 +19,13 @@ pub struct GlobalStat {
     pub download_speed: String,
     #[serde(rename = "uploadSpeed", default = "default_zero_str")]
     pub upload_speed: String,
+    #[allow(dead_code)]
     #[serde(rename = "numActive", default = "default_zero_str")]
     pub num_active: String,
+    #[allow(dead_code)]
     #[serde(rename = "numWaiting", default = "default_zero_str")]
     pub num_waiting: String,
+    #[allow(dead_code)]
     #[serde(rename = "numStopped", default = "default_zero_str")]
     pub num_stopped: String,
 }
@@ -40,6 +42,7 @@ pub struct BittorrentInfo {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BittorrentStatus {
     pub info: Option<BittorrentInfo>,
+    #[allow(dead_code)]
     pub mode: Option<String>,
 }
 
@@ -48,6 +51,7 @@ pub struct FileInfo {
     pub index: String,
     pub path: String,
     pub length: String,
+    #[allow(dead_code)]
     #[serde(rename = "completedLength", default = "default_zero_str")]
     pub completed_length: String,
     #[serde(default)]
@@ -70,23 +74,28 @@ pub struct DownloadStatus {
     pub upload_speed: String,
     #[serde(rename = "infoHash")]
     pub info_hash: Option<String>,
+    #[allow(dead_code)]
     #[serde(rename = "numPieces")]
     pub num_pieces: Option<String>,
+    #[allow(dead_code)]
     #[serde(rename = "pieceLength")]
     pub piece_length: Option<String>,
     #[serde(rename = "numSeeders")]
     pub num_seeders: Option<String>,
     pub seeder: Option<String>,
     pub connections: Option<String>,
+    #[allow(dead_code)]
     #[serde(rename = "errorCode")]
     pub error_code: Option<String>,
     #[serde(rename = "errorMessage")]
     pub error_message: Option<String>,
     #[serde(rename = "followedBy")]
     pub followed_by: Option<Vec<String>>,
+    #[allow(dead_code)]
     pub following: Option<String>,
     pub bittorrent: Option<BittorrentStatus>,
     pub files: Option<Vec<FileInfo>>,
+    #[allow(dead_code)]
     pub dir: Option<String>,
 }
 
@@ -134,10 +143,12 @@ impl Aria2RpcClient {
         }
     }
 
+    #[allow(dead_code)]
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
     }
 
+    #[allow(dead_code)]
     pub fn rpc_secret(&self) -> Option<&str> {
         self.rpc_secret.as_deref()
     }
@@ -247,6 +258,7 @@ impl Aria2RpcClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn get_option(&self, gid: &str) -> Result<Value> {
         self.call_rpc("aria2.getOption", vec![json!(gid)]).await
     }
@@ -281,6 +293,7 @@ impl Aria2RpcClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn force_shutdown(&self) -> Result<()> {
         let _: String = self.call_rpc("aria2.forceShutdown", vec![]).await?;
         Ok(())

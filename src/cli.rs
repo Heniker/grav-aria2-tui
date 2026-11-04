@@ -10,7 +10,7 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Root directory for torrent downloads and .torrent/ metadata
-    #[arg(short = 'd', long = "dir", value_name = "PATH")]
+    #[arg(short = 'd', long = "dir", value_name = "PATH", default_value = ".")]
     pub dir: PathBuf,
 
     /// aria2c JSON-RPC endpoint URL
